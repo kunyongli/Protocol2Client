@@ -23,6 +23,7 @@ import java.security.spec.X509EncodedKeySpec;
 import javax.crypto.BadPaddingException;
 import javax.crypto.Cipher;
 import javax.crypto.IllegalBlockSizeException;
+import javax.crypto.KeyAgreement;
 import javax.crypto.KeyGenerator;
 import javax.crypto.NoSuchPaddingException;
 import javax.crypto.SecretKey;
@@ -37,8 +38,13 @@ public class Protocol2Client
 			"129115595377796797872260754286990587373919932143310995152019820961988539107450691898237693336192317366206087177510922095217647062219921553183876476232430921888985287191036474977937325461650715797148343570627272553218190796724095304058885497484176448065844273193302032730583977829212948191249234100369155852168");
 	static BigInteger	p		= new BigInteger(
 			"165599299559711461271372014575825561168377583182463070194199862059444967049140626852928438236366187571526887969259319366449971919367665844413099962594758448603310339244779450534926105586093307455534702963575018551055314397497631095446414992955062052587163874172731570053362641344616087601787442281135614434639");
-
-	public static void main(String[] args)
+	static Cipher decAESsessionCipher;
+	static Cipher encAESsessionCipher;
+	
+	static Cipher decAESsessionCipher2;
+	static Cipher encAESsessionCipher2;
+	
+	public static void main(String[] args)throws InvalidKeyException
 	{
 		try
 		{
@@ -48,7 +54,10 @@ public class Protocol2Client
 			DataInputStream inStream;
 			outStream = new DataOutputStream(socket.getOutputStream());
 			inStream = new DataInputStream(socket.getInputStream());
-
+			
+			Cipher decAEScipher;
+		    Cipher decAESsessionCipher = null;
+		    decAEScipher = Cipher.getInstance("AES");
 			// Use crypto API to calculate x & g^x
 			DHParameterSpec dhSpec = new DHParameterSpec(p, g);
 			KeyPairGenerator diffieHellmanGen = null;
@@ -80,30 +89,40 @@ public class Protocol2Client
 			PublicKey gToTheY = keyfactoryDH.generatePublic(x509Spec);
    		    System.out.println("g^y len: "+gToTheY.getEncoded().length);
 			System.out.println("g^y cert: "+byteArrayToHexString(gToTheY.getEncoded()));
-		
-			//Protocol Step 3
-		    byte [] keyByte={0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
-			SecretKeySpec secretkeySpec = new SecretKeySpec(keyByte,
-					"AES");
-			Cipher encAESsessionCipher;
-			encAESsessionCipher = Cipher.getInstance("AES");
-			byte[] clientNonce = new byte[16];
 			
-		    System.out.print("clientNonce:"+clientNonce);
+			//Calculate session key
+			calculateSessionKey(x, gToTheY);
+			//Protocol Step 3
+		    	
+			SecureRandom gen = new SecureRandom();
+		    int clientNonce = gen.nextInt();
+		    byte[] clientNonceBytes = BigInteger.valueOf(clientNonce).toByteArray();
+		    byte[] message3 = encAESsessionCipher.doFinal(clientNonceBytes);
+		    outStream.write(message3);
+		    System.out.println("Client nonce: "+clientNonce);
+		    	//Protocol Step 4
+
+		    byte[] message4ct = new byte[32];
+		    inStream.read(message4ct);
+		    byte[] message4 = decAESsessionCipher.doFinal(message4ct);
+		    byte[] serverNonceBytes = new byte[4];
+		    System.arraycopy(message4,16,serverNonceBytes,0,4);
+		    int serverNonce = new BigInteger(serverNonceBytes).intValue();
+		    System.out.println("Server nonce: "+serverNonce);
+		    	//Protocol Step5
+		    byte[] message5 = client2(serverNonceBytes);
+		    byte[] message5ct = encAESsessionCipher.doFinal(message5);
+		    outStream.write(message5ct);
 		    
-		    //Protocol Step 4
-		    Cipher decAEScipher = null;
-		    byte[] serverNonce = new byte[20];
-		    inStream.read(serverNonce);
-		    System.out.print("serverNonce:"+clientNonce);
+			//Protocol Step 6
+		    byte[] message6 = new byte[432];
 		    
-		    //Protocol5
-		    byte[] message5 = new byte[32];
-		    outStream.write(message5);
-		    Cipher encAEScipher=null;
-		    byte[] nonceReplyBytes = encAEScipher.doFinal(encAESsessionCipher.doFinal(message5));
-		    int serverNonceReply = new BigInteger(nonceReplyBytes).intValue();
-		    System.out.println("Server Nonce Reply:"+serverNonceReply);
+		    inStream.read(message6);
+		    int length = inStream.read(message6);
+		    System.out.println("length:"+length);
+		    System.out.println("message6: "+byteArrayToHexString(message6));
+		    byte[] message6ct = decAESsessionCipher.doFinal(message6);
+		    System.out.println(new String(message6ct));
 		}catch (IOException e)
 		{
 			e.printStackTrace();
@@ -129,21 +148,134 @@ public class Protocol2Client
 		}
 	
 	}	
+	private static void calculateSessionKey(PrivateKey y, PublicKey gToTheX)  {
+		    try {
+			// Find g^xy
+			KeyAgreement serverKeyAgree = KeyAgreement.getInstance("DiffieHellman");
+			serverKeyAgree.init(y);
+			serverKeyAgree.doPhase(gToTheX, true);
+			byte[] secretDH = serverKeyAgree.generateSecret();
+			System.out.println("g^xy: "+byteArrayToHexString(secretDH));
+			//Use first 16 bytes of g^xy to make an AES key
+			byte[] aesSecret = new byte[16];
+			System.arraycopy(secretDH,0,aesSecret,0,16);
+			Key aesSessionKey = new SecretKeySpec(aesSecret, "AES");
+			System.out.println("Session key: "+byteArrayToHexString(aesSessionKey.getEncoded()));
+			// Set up Cipher Objects
+			decAESsessionCipher = Cipher.getInstance("AES");
+			decAESsessionCipher.init(Cipher.DECRYPT_MODE, aesSessionKey);
+			encAESsessionCipher = Cipher.getInstance("AES");
+			encAESsessionCipher.init(Cipher.ENCRYPT_MODE, aesSessionKey);
+		    } catch (NoSuchAlgorithmException e ) {
+			System.out.println(e);
+		    } catch (InvalidKeyException e) {
+			System.out.println(e);
+		    } catch (NoSuchPaddingException e) {
+			e.printStackTrace();
+		    }
+		}
+	
+	public static byte[] client2(byte[] serverNonceBytes) {
+		
+		byte[] fakeClientNonce = new byte[16];
+		
+		try {
+			
+			InetAddress ipAddress = InetAddress.getLocalHost();
+			Socket socket = new Socket(ipAddress, portNo);
+			DataOutputStream outStream;
+			DataInputStream inStream;
+			outStream = new DataOutputStream(socket.getOutputStream());
+			inStream = new DataInputStream(socket.getInputStream());
+			
+			Cipher decAEScipher;
+		    Cipher decAESsessionCipher;
+		    decAEScipher = Cipher.getInstance("AES");
+			// Use crypto API to calculate x & g^x
+			DHParameterSpec dhSpec = new DHParameterSpec(p, g);
+			KeyPairGenerator diffieHellmanGen = null;
+			
+			diffieHellmanGen = KeyPairGenerator.getInstance("DiffieHellman");
+		
+			diffieHellmanGen.initialize(dhSpec);
+			
+			KeyPair serverPair = diffieHellmanGen.generateKeyPair();
+			PrivateKey x = serverPair.getPrivate();
+			PublicKey gToTheX = serverPair.getPublic();
 
-	@SuppressWarnings("unused")
-	public static void generateDHprams() throws NoSuchAlgorithmException, InvalidParameterSpecException
-	{
-		AlgorithmParameterGenerator paramGen = AlgorithmParameterGenerator.getInstance("DH");
-		paramGen.init(1024);
-		//Generate the parameters   
-		AlgorithmParameters params = paramGen.generateParameters();
-		DHParameterSpec dhSpec = (DHParameterSpec) params.getParameterSpec(DHParameterSpec.class);
-		System.out.println("These are some good values to use for p & g with Diffie Hellman");
-		System.out.println("p: " + dhSpec.getP());
-		System.out.println("g: " + dhSpec.getG());
+			//Protocol message 1
+			outStream.writeInt(gToTheX.getEncoded().length);
+			outStream.write(gToTheX.getEncoded());
+			System.out.println("g^x len :" + gToTheX.getEncoded().length);
+			System.out.println("g^x cert:" + byteArrayToHexString(gToTheX.getEncoded()));
 
+			//Protocol message 2
+			int publicKenLen = inStream.readInt();
+			byte[] message2 = new byte[publicKenLen];
+			inStream.read(message2);
+			KeyFactory keyfactoryDH = null;
+			
+			keyfactoryDH = KeyFactory.getInstance("DH");
+			
+			X509EncodedKeySpec x509Spec = new X509EncodedKeySpec(message2);
+			
+			PublicKey gToTheY = keyfactoryDH.generatePublic(x509Spec);
+   		    System.out.println("g^y len: "+gToTheY.getEncoded().length);
+			System.out.println("g^y cert: "+byteArrayToHexString(gToTheY.getEncoded()));
+			
+			//Calculate session key
+			calculateSessionKey2(x, gToTheY);
+			//Protocol Step 3
+		    	
+			SecureRandom gen = new SecureRandom();
+		    int clientNonce = gen.nextInt();
+		    byte[] clientNonceBytes = BigInteger.valueOf(clientNonce).toByteArray();
+		    byte[] message3 = encAESsessionCipher.doFinal(clientNonceBytes);
+		    outStream.write(message3);
+		    System.out.println("Client nonce: "+clientNonce);
+		    
+			//Protocol Step 4
+		    byte[] message4ct = new byte[32];
+		    inStream.read(message4ct);
+		    byte[] message4 = decAESsessionCipher2.doFinal(message4ct);
+		    System.arraycopy(message4,0,fakeClientNonce,0,16);
+		    
+		    
+		
+		}catch(Exception e){
+		System.out.println(e);
 	}
-
+		
+		return fakeClientNonce;
+		
+	}
+	// This method sets decAESsessioncipher & encAESsessioncipher 
+	private static void calculateSessionKey2(PrivateKey y, PublicKey gToTheX)  {
+	    try {
+		// Find g^xy
+		KeyAgreement serverKeyAgree = KeyAgreement.getInstance("DiffieHellman");
+		serverKeyAgree.init(y);
+		serverKeyAgree.doPhase(gToTheX, true);
+		byte[] secretDH = serverKeyAgree.generateSecret();
+		System.out.println("g^xy: "+byteArrayToHexString(secretDH));
+		//Use first 16 bytes of g^xy to make an AES key
+		byte[] aesSecret = new byte[16];
+		System.arraycopy(secretDH,0,aesSecret,0,16);
+		Key aesSessionKey = new SecretKeySpec(aesSecret, "AES");
+		System.out.println("Session key: "+byteArrayToHexString(aesSessionKey.getEncoded()));
+		// Set up Cipher Objects
+		decAESsessionCipher2 = Cipher.getInstance("AES");
+		decAESsessionCipher2.init(Cipher.DECRYPT_MODE, aesSessionKey);
+		encAESsessionCipher2 = Cipher.getInstance("AES");
+		encAESsessionCipher2.init(Cipher.ENCRYPT_MODE, aesSessionKey);
+	    } catch (NoSuchAlgorithmException e ) {
+		System.out.println(e);
+	    } catch (InvalidKeyException e) {
+		System.out.println(e);
+	    } catch (NoSuchPaddingException e) {
+		e.printStackTrace();
+	    }
+	}
 	private static String byteArrayToHexString(byte[] data)
 	{
 		StringBuffer buf = new StringBuffer();
@@ -173,5 +305,4 @@ public class Protocol2Client
 		}
 		return data;
 	}
-
 }
